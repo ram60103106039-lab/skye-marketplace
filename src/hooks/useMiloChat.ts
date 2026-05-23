@@ -11,13 +11,12 @@ import {
 } from '../lib/miloAgent';
 import { sendWebhookRequest, buildWebhookPayload, type WebhookMatch } from '../lib/webhook';
 
-type ChatEntry = {
+export type ChatEntry = {
   id: string;
   role: 'user' | 'agent';
   content: string;
-  type: 'text' | 'telemetry' | 'match_cards' | 'status' | 'error';
+  type: 'text' | 'matching_progress' | 'match_cards' | 'status' | 'error';
   matches?: GigMatch[];
-  showTelemetry?: boolean;
   timestamp: Date;
 };
 
@@ -46,6 +45,9 @@ const INITIAL_GIG_DATA: ExtractedGigData = {
   pay_max: null,
 };
 
+// Total animation time for the matching progress UI
+const MATCHING_STEPS_TOTAL_MS = 3700;
+
 export function useMiloChat({
   profile,
   userId,
@@ -64,10 +66,6 @@ export function useMiloChat({
   const [currentGigId, setCurrentGigId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const addEntry = useCallback((entry: ChatEntry) => {
-    setEntries((prev) => [...prev, entry]);
-  }, []);
-
   const agentSay = useCallback((content: string, type: ChatEntry['type'] = 'text', extra?: Partial<ChatEntry>) => {
     const entry = makeEntry('agent', content, type, extra);
     setEntries((prev) => [...prev, entry]);
@@ -82,9 +80,6 @@ export function useMiloChat({
   }, []);
 
   const handleWebhookFlow = useCallback(async (data: ExtractedGigData, rawMessage: string) => {
-    const gigId = crypto.randomUUID();
-
-    // Save gig to DB
     const savedGig = await onSaveGig({
       type: data.mode!,
       title: data.title || data.category || 'Campus Gig',
@@ -103,15 +98,15 @@ export function useMiloChat({
       webhook_payload: null,
     });
 
-    const resolvedGigId = savedGig.data?.id ?? gigId;
+    const resolvedGigId = savedGig.data?.id ?? crypto.randomUUID();
     setCurrentGigId(resolvedGigId);
 
-    // Show telemetry
-    const telEntry = makeEntry('agent', '', 'telemetry', { showTelemetry: true });
-    setEntries((prev) => [...prev, telEntry]);
+    // Show live matching progress card
+    const progressEntry = makeEntry('agent', '', 'matching_progress');
+    setEntries((prev) => [...prev, progressEntry]);
     setPhase('submitted');
 
-    // Build and send webhook
+    // Build payload and start network request in parallel with the UI animation
     const payload = buildWebhookPayload(profile, rawMessage, {
       gig_id: resolvedGigId,
       gig_type: data.mode!,
@@ -127,7 +122,11 @@ export function useMiloChat({
 
     try {
       abortRef.current = new AbortController();
-      const response = await sendWebhookRequest(payload, abortRef.current.signal);
+      const [response] = await Promise.all([
+        sendWebhookRequest(payload, abortRef.current.signal),
+        // Ensure the progress animation plays fully before showing results
+        new Promise((r) => setTimeout(r, MATCHING_STEPS_TOTAL_MS)),
+      ]);
 
       if (!response.success || response.matches.length === 0) {
         agentSay("I couldn't find any matches right now. Try adjusting your preferences or check back shortly.", 'status');
@@ -135,7 +134,6 @@ export function useMiloChat({
         return;
       }
 
-      // Convert to GigMatch shape
       const gigMatches: GigMatch[] = response.matches.map((m: WebhookMatch) => ({
         id: m.id,
         gig_id: resolvedGigId,
@@ -160,7 +158,7 @@ export function useMiloChat({
 
       const top = gigMatches[0];
       agentSay(
-        `Match Confirmed: **${top.matched_user_name}** is a **${top.match_score}% fit** and only a **${top.walk_time_mins}-minute walk** away. Here are your top matches:`,
+        `Top match: **${top.matched_user_name}** — **${top.match_score}% fit**, ${top.walk_time_mins} min walk away. Here are all your matches:`,
         'text'
       );
 
@@ -169,10 +167,7 @@ export function useMiloChat({
       setPhase('browsing_matches');
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return;
-      agentSay(
-        "The matching service timed out. Please try again — your gig has been saved.",
-        'error'
-      );
+      agentSay("The matching service timed out. Please try again — your gig has been saved.", 'error');
       resetConversation();
     } finally {
       setIsThinking(false);
@@ -189,7 +184,6 @@ export function useMiloChat({
 
     const lower = trimmed.toLowerCase();
 
-    // Allow mode switch at any time
     if ((lower.includes('switch') || lower.includes('actually')) && phase !== 'mode_select') {
       const newMode = detectMode(trimmed);
       if (newMode) {
@@ -202,11 +196,14 @@ export function useMiloChat({
 
     setIsThinking(true);
 
-    // Small natural delay
-    await new Promise((r) => setTimeout(r, 400 + Math.random() * 300));
+    await new Promise((r) => setTimeout(r, 350 + Math.random() * 250));
 
     if (phase === 'mode_select' || phase === 'greeting') {
-      const mode = detectMode(trimmed) ?? (lower.includes('post') ? 'post' : lower.includes('find') || lower.includes('search') || lower.includes('earn') ? 'search' : null);
+      const mode = detectMode(trimmed) ?? (
+        lower.includes('post') ? 'post' :
+        lower.includes('find') || lower.includes('search') || lower.includes('earn') ? 'search' :
+        null
+      );
 
       if (!mode) {
         agentSay("I can help you **post a gig** (need something done) or **find a gig** (earn money). Which would you like?");
@@ -242,7 +239,7 @@ export function useMiloChat({
 
     if (phase === 'collect_location') {
       const loc = extractLocation(trimmed);
-      const isRemote = trimmed.toLowerCase().includes('remote') || trimmed.toLowerCase().includes('online');
+      const isRemote = lower.includes('remote') || lower.includes('online');
       const pay = extractPayRange(trimmed);
 
       const updatedData: ExtractedGigData = {
@@ -286,16 +283,15 @@ export function useMiloChat({
         agentSay(getMiloResponse('submitted', gigData, trimmed));
         await handleWebhookFlow(gigData, trimmed);
       } else {
-        // Re-collect
         setPhase('collect_category');
-        agentSay("No problem! Let's adjust. What would you like to change — the category, location, or pay range?");
+        agentSay("No problem! What would you like to change — the category, location, or pay range?");
         setIsThinking(false);
       }
       return;
     }
 
     if (phase === 'browsing_matches' || phase === 'submitted') {
-      agentSay("Your matches are shown above. You can accept or decline each one. Want to post another gig or search for something else?");
+      agentSay("Your matches are shown above. Accept or decline each one. Want to post another gig or search for something new?");
       resetConversation();
       setIsThinking(false);
       return;
@@ -311,7 +307,7 @@ export function useMiloChat({
     const match = allMatches.find((m) => m.id === matchId);
     agentSay(
       match
-        ? `Payment of **$${match.pay_max}** is now held in escrow. ${match.matched_user_name} has been notified — your gig is in progress!`
+        ? `**$${match.pay_max}** is now held in escrow. **${match.matched_user_name}** has been notified — gig is in progress! Release escrow when the work is done.`
         : 'Match accepted! Escrow is now active.',
       'status'
     );
@@ -325,7 +321,9 @@ export function useMiloChat({
     await onReleaseEscrow(matchId);
     const match = allMatches.find((m) => m.id === matchId);
     agentSay(
-      match ? `Escrow released — $${match.pay_max} sent to ${match.matched_user_name}. Gig complete!` : 'Escrow payment released.',
+      match
+        ? `Escrow released — **$${match.pay_max}** sent to **${match.matched_user_name}**. Gig complete!`
+        : 'Escrow payment released.',
       'status'
     );
   }, [onReleaseEscrow, agentSay]);
